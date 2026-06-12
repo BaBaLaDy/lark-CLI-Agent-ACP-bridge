@@ -44,6 +44,20 @@ lark-acp-bridge init
 lark-acp-bridge start
 ```
 
+### 升级版本
+
+当 GitHub 仓库有更新时，重新运行安装命令即可升级到最新版：
+
+```bash
+pip install --upgrade git+https://github.com/BaBaLaDy/lark-CLI-ACP-bridge.git
+
+# 确认版本
+lark-acp-bridge version
+```
+
+> **注意**：升级只更新 bridge 代码，不会影响 `~/.lark-acp-bridge/` 中的配置文件。
+> 如需重新初始化配置，运行 `lark-acp-bridge init --force`。
+
 ---
 
 ## 功能特性
@@ -175,14 +189,24 @@ show_tool_calls = true
 ### `lark-acp-bridge init`
 
 交互式初始化向导。检查环境、引导安装 Agent CLI、配置飞书凭证。
+若配置文件已存在，默认保留，不会覆盖。
 
 ```bash
-lark-acp-bridge init [--skip-checks]
+lark-acp-bridge init [--skip-checks] [--force]
 ```
 
 | 选项 | 说明 |
 |------|------|
 | `--skip-checks` | 跳过 Node.js 环境检查（用于 CI 等非交互场景） |
+| `--force` / `-f` | 强制重新配置，覆盖已有配置文件 |
+
+### `lark-acp-bridge version`
+
+显示当前安装的版本号。
+
+```bash
+lark-acp-bridge version
+```
 
 ### `lark-acp-bridge start`
 

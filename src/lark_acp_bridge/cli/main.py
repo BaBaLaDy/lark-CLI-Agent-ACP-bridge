@@ -106,16 +106,40 @@ def _resolve_command(cmd: str) -> str | None:
 @app.command()
 def init(
     skip_checks: bool = typer.Option(False, "--skip-checks", help="跳过环境检查（非交互场景）"),
+    force: bool = typer.Option(False, "--force", "-f", help="强制重新配置，忽略已有配置文件"),
 ) -> None:
     """初始化配置文件（交互式向导）。
 
     引导你完成环境检查、Agent 选择和飞书凭证配置，
     将结果写入 ~/.lark-acp-bridge/config.toml 和 agents.json。
+    若配置文件已存在，默认跳过向导；使用 --force 强制重新配置。
     """
     from ..config.settings import get_config_path
 
+    config_path = get_config_path()
+    agents_json_path = get_agents_json_path(config_path)
+
     typer.echo("\n🚀  Lark ACP Bridge 初始化向导")
     typer.echo("═" * 36)
+
+    # ── 0. 检测已有配置 ──────────────────────────────────────────────────────
+    if config_path.exists() and not force:
+        typer.echo(f"\n📁  检测到已有配置：{config_path}")
+        existing = load_settings(config_path)
+        typer.echo(f"   飞书 App ID : {existing.feishu_app_id or '（未设置）'}")
+        typer.echo(f"   工作目录    : {existing.working_dir}")
+        if existing.agents:
+            active_marker = f" ◀ active" if existing.active_agent else ""
+            typer.echo(f"   已配置 Agent: {', '.join(existing.agents.keys())}{active_marker}")
+        if agents_json_path.exists():
+            typer.echo(f"   agents.json : {agents_json_path}")
+
+        reconfigure = typer.confirm("\n   是否重新配置？", default=False)
+        if not reconfigure:
+            typer.echo("\n✅  保留现有配置，跳过初始化向导。")
+            typer.echo("   如需重新配置，运行：lark-acp-bridge init --force")
+            typer.echo()
+            return
 
     # ── 1. 环境检查 ──────────────────────────────────────────────────────────
     if not skip_checks:
@@ -578,6 +602,13 @@ def config() -> None:
         for name, cfg in settings.agents.items():
             marker = " ◀ active" if name == settings.active_agent else ""
             typer.echo(f"  [{name}]{marker}  {' '.join(cfg.full_command)}  {cfg.description}")
+
+
+@app.command()
+def version() -> None:
+    """显示当前版本。"""
+    from .. import __version__
+    typer.echo(f"lark-acp-bridge {__version__}")
 
 
 def _run_async(coro) -> None:
