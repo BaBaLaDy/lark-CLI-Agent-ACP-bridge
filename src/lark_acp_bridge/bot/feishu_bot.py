@@ -431,6 +431,7 @@ class FeishuBot:
             handler_builder = handler_builder.register_p2_customized_event(
                 "drive.notice.comment_add_v1", on_comment_add
             )
+            logger.info("doc-comment-handler-registered", event_type="drive.notice.comment_add_v1")
         except AttributeError:
             # Older SDK versions without register_p2_customized_event: fall back to no-op
             # injection so the "processor not found" log doesn't spam.
@@ -449,9 +450,12 @@ class FeishuBot:
                     handler._processorMap["p2.drive.notice.comment_add_v1"] = _NoOpProcessor()
             except Exception:
                 pass
+            logger.info("event-handler-built-fallback", processors=list(handler._processorMap.keys()))
             return handler
 
-        return handler_builder.build()
+        handler = handler_builder.build()
+        logger.info("event-handler-built", processors=list(handler._processorMap.keys()))
+        return handler
 
     @staticmethod
     def _event_to_dict(event: P2ImMessageReceiveV1) -> dict[str, Any]:

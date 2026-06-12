@@ -445,7 +445,7 @@ def start(
                 agent_manager._default_agent = settings.active_agent
             await agent_manager.load_agents(agents_json_path)
             agent_count = len(agent_manager.registered_names)
-            typer.echo(f"🤖 Multi-agent mode: {agent_count} agent(s) registered, default: {agent_manager._default_agent}")
+            typer.echo(f"[agents] Multi-agent mode: {agent_count} agent(s) registered, default: {agent_manager._default_agent}")
 
         # Legacy single-bridge fallback
         bridge: CodexACPBridge | None = None
@@ -459,7 +459,7 @@ def start(
                 agent_env=resolved_agent_env,
             )
             await bridge.start()
-            typer.echo(f"✅ 桥接服务已启动 (mode={mode}, agent={resolved_agent_name})")
+            typer.echo(f"[start] Bridge started (mode={mode}, agent={resolved_agent_name})")
 
         bot = FeishuBot(
             settings=settings,
@@ -504,7 +504,7 @@ def start(
         logger.info("shutdown-complete")
 
     _run_async(run_bridge())
-    typer.echo("\n⛔ 服务已退出。")
+    typer.echo("\n[exit] 服务已退出。")
 
 
 async def _run_bot(bot: FeishuBot, mode: str, webhook_port: int) -> None:
