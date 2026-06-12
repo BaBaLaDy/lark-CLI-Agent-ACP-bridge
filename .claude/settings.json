@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la \"F:\\\\myagentProject\\\\lark-coding-agent-bridge\")",
+      "Read(//f/myagentProject/lark-coding-agent-bridge/**)",
+      "Bash(find \"F:\\\\myagentProject\\\\lark-coding-agent-bridge\" -maxdepth 1 -type f -o -type d | sort)",
+      "Bash(python -m pytest tests/ -v)",
+      "WebFetch(domain:opencode.ai)",
+      "WebFetch(domain:docs.qoder.com)",
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(claude --version)",
+      "Read(//c/Users/admin/AppData/Roaming/npm/node_modules/@anthropic-ai/**)",
+      "Bash(npm list *)",
+      "Bash(cat \"C:/Users/admin/AppData/Roaming/npm/claude\" 2>&1)",
+      "Read(//c/Users/admin/AppData/Roaming/npm/**)",
+      "PowerShell(& \"C:\\\\Users\\\\admin\\\\AppData\\\\Roaming\\\\npm\\\\node_modules\\\\@anthropic-ai\\\\claude-code\\\\bin\\\\claude.exe\" --version 2>&1)",
+      "PowerShell(& \"C:\\\\Users\\\\admin\\\\AppData\\\\Roaming\\\\npm\\\\node_modules\\\\@anthropic-ai\\\\claude-code\\\\bin\\\\claude.exe\" --help 2>&1)",
+      "Skill(claude-api)",
+      "Skill(claude-api:*)"
+    ]
+  }
+}

@@ -1,0 +1,81 @@
+ # Lark ACP Bridge 配置文件示例
+ # 复制此文件为 config.toml 并填入真实值
+
+ [feishu]
+ # 飞书应用 ID（从飞书开放平台获取）
+ app_id = "cli_xxxxxxxxxx"
+
+ # 飞书应用密钥（从飞书开放平台获取）
+ app_secret = "your_feishu_app_secret_here"
+
+[openai]
+# 可选：OpenAI API 密钥。
+# 留空时，bridge 不会注入 OPENAI_API_KEY，而是让 codex-acp 使用你本机已配置好的 Codex 登录态。
+api_key = ""
+
+# 可选：OpenAI 兼容服务 Base URL，例如第三方兼容服务。
+# 留空时使用默认。
+# base_url = "https://your-openai-compatible-endpoint/v1"
+
+ # 可选：指定模型（留空则使用 Codex 默认模型）
+ # model = "gpt-4-turbo"
+
+ [general]
+ # 工作目录（Codex 将在此目录下操作）
+ working_dir = "/path/to/your/project"
+
+ # 日志级别：DEBUG, INFO, WARNING, ERROR
+ log_level = "INFO"
+
+ # Agent 无响应超时（秒）。超时后自动中断当前运行。
+ idle_timeout_seconds = 300
+
+ # 卡片流式更新节流间隔（毫秒）。每隔这么多毫秒更新一次飞书卡片。
+ card_update_throttle_ms = 400
+
+ # 每个用户最大并发 Agent 运行数。设为 1 表示同一用户同时只能有一个运行。
+ max_concurrent_runs_per_user = 1
+
+[agent]
+ # 是否在飞书卡片中展示工具调用过程（读文件、执行命令等）。
+ show_tool_calls = true
+
+ # 可选：自定义 ACP Agent 启动命令。留空则使用内置的 @zed-industries/codex-acp。
+ # 示例：启动自定义 ACP Agent
+ # command = ["python", "my_acp_agent.py"]
+
+ # 可选：选用下方 [agents.*] 中定义的某个 agent。
+ # 设置后将忽略上方 command 字段，使用对应 agent 的命令和环境变量。
+ # active = "claude"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 多 Agent 配置（可选）
+# 在 [agents.<名称>] 中定义多个 ACP 兼容 agent，通过 [agent] active = "<名称>" 选用。
+# 格式与 Zed / JetBrains 的 agent_servers JSON 格式对应。
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Claude Code（需先安装：npm install -g @agentclientprotocol/claude-agent-acp）
+# [agents.claude]
+# command = "claude-agent-acp"
+# args = []
+# env = { ANTHROPIC_API_KEY = "sk-ant-your-key-here" }
+# description = "Claude Code"
+
+# OpenCode（需先安装：npm install -g opencode-ai）
+# [agents.opencode]
+# command = "opencode"
+# args = ["acp"]
+# description = "OpenCode (multi-provider)"
+
+# Qoder（需先安装：npm install -g @qoder/cli）
+# [agents.qoder]
+# command = "qodercli"
+# args = ["--acp"]
+# env = { QODER_PERSONAL_ACCESS_TOKEN = "your-token-here" }
+# description = "Qoder"
+
+# Kiro（需先安装 Kiro CLI）
+# [agents.kiro]
+# command = "kiro-cli"
+# args = ["acp", "--trust-all-tools"]
+# description = "Kiro"

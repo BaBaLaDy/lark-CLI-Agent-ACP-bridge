@@ -1,0 +1,32 @@
+{
+  "active": "claude",
+
+  "agent_servers": {
+    "claude": {
+      "command": "claude-agent-acp",
+      "args": [],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-your-key-here"
+      },
+      "description": "Claude Code"
+    },
+    "opencode": {
+      "command": "opencode",
+      "args": ["acp"],
+      "description": "OpenCode (multi-provider)"
+    },
+    "qoder": {
+      "command": "qodercli",
+      "args": ["--acp"],
+      "env": {
+        "QODER_PERSONAL_ACCESS_TOKEN": "your-token-here"
+      },
+      "description": "Qoder"
+    },
+    "kiro": {
+      "command": "kiro-cli",
+      "args": ["acp", "--trust-all-tools"],
+      "description": "Kiro"
+    }
+  }
+}

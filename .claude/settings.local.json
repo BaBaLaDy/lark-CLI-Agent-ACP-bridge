@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-Process)",
+      "PowerShell(Get-ChildItem -Path \"F:\\\\myagentProject\\\\acp-bridge-proj\\\\lark-acp-bridge\" -Force | Where-Object { $_.Name -ne \".venv\" } | Format-Table Name, PSIsContainer, Length -AutoSize)"
+    ]
+  }
+}
