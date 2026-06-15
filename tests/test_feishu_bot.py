@@ -72,9 +72,6 @@ def test_active_tasks_starts_empty() -> None:
 # Command routing (unit-level via _handle_command)
 # ----------------------------------------------------------------------- #
 
-import pytest  # noqa: E402
-
-
 @pytest.mark.asyncio
 async def test_handle_command_help_sends_message() -> None:
     bot = _make_bot()

@@ -6,14 +6,11 @@ import asyncio
 import sys
 from collections.abc import Callable
 from shutil import which
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import structlog
 
 from .client import ACPClient, SessionState
-
-if TYPE_CHECKING:
-    pass
 
 logger = structlog.get_logger()
 

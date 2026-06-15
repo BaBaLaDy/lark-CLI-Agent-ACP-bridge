@@ -57,5 +57,6 @@ __pycache__/
 *.pyc
 .claude/
 
+docs/
 
 openspec/

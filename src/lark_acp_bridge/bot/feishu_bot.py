@@ -54,15 +54,9 @@ from ..card import (
 )
 from ..config.settings import Settings
 
-# Optional import — available only after multi-agent-switching implementation
-try:
-    from ..acp.agent_manager import AgentManager
-    from ..config.workspace_store import WorkspaceStore
-    from ..config.session_store import SessionStore
-except ImportError:
-    AgentManager = None  # type: ignore[assignment,misc]
-    WorkspaceStore = None  # type: ignore[assignment,misc]
-    SessionStore = None  # type: ignore[assignment,misc]
+from ..acp.agent_manager import AgentManager
+from ..config.workspace_store import WorkspaceStore
+from ..config.session_store import SessionStore
 
 # Inbound attachment support — always available
 from ..media.attachment import AttachmentInfo, apply_attachment_policy, download_and_cache
@@ -253,9 +247,9 @@ class FeishuBot:
         settings: Settings,
         codex_bridge: CodexACPBridge | None = None,
         agent_name: str = "",
-        agent_manager: "AgentManager | None" = None,
-        workspace_store: "WorkspaceStore | None" = None,
-        session_store: "SessionStore | None" = None,
+        agent_manager: AgentManager | None = None,
+        workspace_store: WorkspaceStore | None = None,
+        session_store: SessionStore | None = None,
     ):
         self._settings = settings
         self.codex_bridge = codex_bridge
@@ -278,9 +272,6 @@ class FeishuBot:
         self._seen_message_ids: dict[str, float] = {}
         # user_id → asyncio.Task; tracks in-flight agent runs per user
         self._active_tasks: dict[str, asyncio.Task] = {}
-        # Per-chat working directory cwd overrides (set via /cd command)
-        # scope_key → cwd_path
-        self._cwd_by_scope: dict[str, str] = {}
         # Bot's own open_id, fetched once on first use
         self._bot_open_id: str | None = None
         # Shutdown coordination
@@ -1005,7 +996,7 @@ class FeishuBot:
         key = self._scope_key(chat_id, chat_type, user_id)
         if self._workspace_store is not None:
             return self._workspace_store.get_cwd(key, str(self._settings.working_dir))
-        return self._cwd_by_scope.get(key, str(self._settings.working_dir))
+        return str(self._settings.working_dir)
 
     def _resolve_agent_name(self, user_id: str, chat_id: str, chat_type: str) -> str | None:
         """Return the agent name to use for the given scope."""
@@ -1046,6 +1037,19 @@ class FeishuBot:
                 cwd=cwd or str(self._settings.working_dir),
                 preview=preview,
             )
+
+    async def _reset_session(
+        self, user_id: str, chat_id: str, chat_type: str, agent_name: str | None = None,
+    ) -> str:
+        """Close the old session and create a new one. Return the new session_id."""
+        agent = agent_name or self._resolve_agent_name(user_id, chat_id, chat_type)
+        if self._agent_manager is not None and agent:
+            await self._agent_manager.close_session(agent_name=agent, user_id=user_id)
+            return await self._agent_manager.create_session(agent_name=agent, user_id=user_id)
+        elif self.codex_bridge is not None:
+            await self.codex_bridge.close_session(user_id=user_id)
+            return await self.codex_bridge.create_session(user_id=user_id)
+        return "(no session)"
 
     async def _create_and_record_session(
         self, user_id: str, agent_name: str | None = None,
@@ -1180,8 +1184,7 @@ class FeishuBot:
                 return
             # Reset session for the new agent
             try:
-                await self._agent_manager.close_session(agent_name=name, user_id=user_id)
-                session_id = await self._agent_manager.create_session(agent_name=name, user_id=user_id)
+                session_id = await self._reset_session(user_id, chat_id, chat_type, agent_name=name)
                 # Find description
                 desc = next((a.description for a in agents if a.name == name), name)
                 await self._reply_card(message_id, agent_switched_card(name, desc, session_id))
@@ -1235,19 +1238,9 @@ class FeishuBot:
         key = self._scope_key(chat_id, chat_type, user_id)
         if self._workspace_store is not None:
             self._workspace_store.set_cwd(key, str(target))
-        else:
-            self._cwd_by_scope[key] = str(target)
 
         # Reset session for the scope
-        agent_name = self._resolve_agent_name(user_id, chat_id, chat_type)
-        if self._agent_manager is not None and agent_name:
-            await self._agent_manager.close_session(agent_name=agent_name, user_id=user_id)
-            session_id = await self._agent_manager.create_session(agent_name=agent_name, user_id=user_id)
-        elif self.codex_bridge is not None:
-            await self.codex_bridge.close_session(user_id=user_id)
-            session_id = await self.codex_bridge.create_session(user_id=user_id)
-        else:
-            session_id = "(no session)"
+        session_id = await self._reset_session(user_id, chat_id, chat_type)
 
         await self._reply_card(message_id, simple_text_card(
             f"✅ cwd 已切换到: `{target}`\n会话 ID: `{session_id}`", "📁 工作目录"
@@ -1300,16 +1293,7 @@ class FeishuBot:
                 return
             key = self._scope_key(chat_id, chat_type, user_id)
             self._workspace_store.set_cwd(key, path)
-            # Reset session
-            agent_name = self._resolve_agent_name(user_id, chat_id, chat_type)
-            if self._agent_manager is not None and agent_name:
-                await self._agent_manager.close_session(agent_name=agent_name, user_id=user_id)
-                session_id = await self._agent_manager.create_session(agent_name=agent_name, user_id=user_id)
-            elif self.codex_bridge is not None:
-                await self.codex_bridge.close_session(user_id=user_id)
-                session_id = await self.codex_bridge.create_session(user_id=user_id)
-            else:
-                session_id = "(no session)"
+            session_id = await self._reset_session(user_id, chat_id, chat_type)
             await self._reply_card(message_id, simple_text_card(
                 f"✅ 已切换到 `{name}` → `{path}`\n会话 ID: `{session_id}`", "📂 工作空间"
             ))
@@ -1468,26 +1452,7 @@ class FeishuBot:
         logger.info("card-action", cmd=cmd, user_id=user_id, chat_id=chat_id)
 
         if cmd == "new":
-            agent_name = self._resolve_agent_name(user_id, chat_id, "p2p")
-            if self._agent_manager is not None and agent_name:
-                await self._agent_manager.close_session(agent_name=agent_name, user_id=user_id)
-                session_id = await self._agent_manager.create_session(agent_name=agent_name, user_id=user_id)
-                sess_count = self._agent_manager.active_session_count(agent_name)
-                running = self._agent_manager.is_running
-                a_type = f"multi-agent (active={agent_name})"
-                a_cmd = agent_name
-            elif self.codex_bridge is not None:
-                await self.codex_bridge.close_session(user_id=user_id)
-                session_id = await self.codex_bridge.create_session(user_id=user_id)
-                sess_count = self.codex_bridge.active_session_count
-                running = self.codex_bridge.is_running
-                a_type = "custom" if self._settings.agent_command else "codex"
-                a_cmd = self._agent_name
-            else:
-                sess_count = 0
-                running = False
-                a_type = "none"
-                a_cmd = "(none)"
+            session_id = await self._reset_session(user_id, chat_id, "p2p")
             await self._send_card(chat_id, simple_text_card(
                 f"✅ 新会话已创建\n会话 ID: `{session_id}`", "🆕 新会话"
             ))
@@ -1562,8 +1527,7 @@ class FeishuBot:
                 scope = self._agent_manager.scope_key(user_id, chat_id, "group")
                 try:
                     self._agent_manager.set_active_agent(scope, name)
-                    await self._agent_manager.close_session(agent_name=name, user_id=user_id)
-                    session_id = await self._agent_manager.create_session(agent_name=name, user_id=user_id)
+                    session_id = await self._reset_session(user_id, chat_id, "group", agent_name=name)
                     agents = self._agent_manager.list_agents()
                     desc = next((a.description for a in agents if a.name == name), name)
                     await self._send_card(chat_id, agent_switched_card(name, desc, session_id))
