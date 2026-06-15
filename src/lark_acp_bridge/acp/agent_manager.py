@@ -151,9 +151,9 @@ class AgentManager:
 
         existing = self._bridges.get(name)
         if existing is not None:
-            if existing.is_running:
+            if existing.is_connected:
                 return existing
-            # Bridge died — remove and recreate
+            # Bridge died or connection lost — remove and recreate
             logger.warning("bridge-died-recreating", agent=name)
             del self._bridges[name]
 
@@ -211,21 +211,45 @@ class AgentManager:
         on_text: Callable[[str], None] | None = None,
         on_state_change: Callable[[SessionState], None] | None = None,
         on_session_reset: Callable[[], None] | None = None,
+        extra_blocks: list[Any] | None = None,
     ) -> SessionState:
         """Route a chat message to the named agent bridge.
 
         ``on_session_reset`` is forwarded to the bridge and called when
         a new session had to be created (context lost).
+
+        ``extra_blocks`` is forwarded to the bridge's ACP prompt (e.g.
+        inbound image blocks from Feishu).
+
+        If the ACP connection is dead, the stale bridge is removed and a
+        fresh one is started for a single automatic retry.
         """
         bridge = await self.get_bridge(agent_name)
-        return await bridge.chat(
-            message=message,
-            user_id=user_id,
-            session_id=session_id,
-            on_text=on_text,
-            on_state_change=on_state_change,
-            on_session_reset=on_session_reset,
-        )
+        try:
+            return await bridge.chat(
+                message=message,
+                user_id=user_id,
+                session_id=session_id,
+                on_text=on_text,
+                on_state_change=on_state_change,
+                on_session_reset=on_session_reset,
+                extra_blocks=extra_blocks,
+            )
+        except ConnectionError:
+            # Agent subprocess exited unexpectedly — clear stale bridge
+            # and retry once with a fresh bridge + new session.
+            logger.warning("bridge-connection-lost-retrying", agent=agent_name)
+            self._bridges.pop(agent_name, None)
+            bridge = await self.get_bridge(agent_name)
+            return await bridge.chat(
+                message=message,
+                user_id=user_id,
+                session_id=session_id,
+                on_text=on_text,
+                on_state_change=on_state_change,
+                on_session_reset=on_session_reset,
+                extra_blocks=extra_blocks,
+            )
 
     async def cancel(
         self,

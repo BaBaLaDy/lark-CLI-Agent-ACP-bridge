@@ -5,6 +5,9 @@ from __future__ import annotations
 import time
 from unittest.mock import AsyncMock, Mock
 
+import pytest
+
+from lark_acp_bridge.acp.client import SessionState
 from lark_acp_bridge.bot.feishu_bot import FeishuBot
 from lark_acp_bridge.config.settings import Settings
 
@@ -266,3 +269,123 @@ def test_parse_prefix_routing_whitespace_in_prefix() -> None:
     name, prompt = parse_prefix_routing(" claude : do X", agents)
     assert name == "claude"
     assert prompt == "do X"
+
+
+# ----------------------------------------------------------------------- #
+# _extract_text_base64_images tests
+# ----------------------------------------------------------------------- #
+
+def _make_state(text: str) -> SessionState:
+    state = SessionState()
+    state.text_chunks.append(text)
+    return state
+
+
+# Fake base64 strings long enough to pass the 100-char minimum
+_B64_LONG = "A" * 100 + "=="          # 102 chars, valid padding
+_B64_JPEG = "B" * 100 + "="           # 101 chars — padding check test too
+_B64_LINE = "A" * 76                   # exactly one standard base64 line
+
+
+def test_extract_no_base64_leaves_state_unchanged() -> None:
+    state = _make_state("Hello, world! 你好")
+    FeishuBot._extract_text_base64_images(state)
+    assert state.full_text == "Hello, world! 你好"
+    assert state.images == []
+
+
+def test_extract_empty_text_is_noop() -> None:
+    state = _make_state("")
+    FeishuBot._extract_text_base64_images(state)
+    assert state.full_text == ""
+    assert state.images == []
+
+
+def test_extract_pattern1_data_uri_png() -> None:
+    text = f"看图：\ndata:image/png;base64,{_B64_LONG}\n结束"
+    state = _make_state(text)
+    FeishuBot._extract_text_base64_images(state)
+    assert len(state.images) == 1
+    assert state.images[0].mime_type == "image/png"
+    assert state.images[0].data == _B64_LONG
+    assert "data:image" not in state.full_text
+    assert "看图" in state.full_text
+    assert "结束" in state.full_text
+
+
+def test_extract_pattern1_data_uri_jpeg() -> None:
+    text = f"data:image/jpeg;base64,{_B64_LONG}"
+    state = _make_state(text)
+    FeishuBot._extract_text_base64_images(state)
+    assert len(state.images) == 1
+    assert state.images[0].mime_type == "image/jpeg"
+
+
+def test_extract_pattern1_jpg_normalized_to_jpeg() -> None:
+    text = f"data:image/jpg;base64,{_B64_LONG}"
+    state = _make_state(text)
+    FeishuBot._extract_text_base64_images(state)
+    assert state.images[0].mime_type == "image/jpeg"
+
+
+def test_extract_pattern2_code_block() -> None:
+    b64_content = f"{_B64_LINE}\n{_B64_LINE}\nAA=="
+    text = f"图片：\n```base64\n{b64_content}\n```\n后续文字"
+    state = _make_state(text)
+    FeishuBot._extract_text_base64_images(state)
+    assert len(state.images) == 1
+    assert state.images[0].mime_type == "image/png"
+    assert "```" not in state.full_text
+    assert "后续文字" in state.full_text
+
+
+def test_extract_pattern3_standalone_line() -> None:
+    text = f"看图\n{_B64_LONG}\n后续"
+    state = _make_state(text)
+    FeishuBot._extract_text_base64_images(state)
+    assert len(state.images) == 1
+    assert _B64_LONG not in state.full_text
+    assert "看图" in state.full_text
+    assert "后续" in state.full_text
+
+
+def test_extract_pattern4_multiline_block() -> None:
+    b64_block = f"{_B64_LINE}\n{_B64_LINE}\n{_B64_LINE}\nAA=="
+    text = f"图片如下：\n{b64_block}\n以上"
+    state = _make_state(text)
+    FeishuBot._extract_text_base64_images(state)
+    assert len(state.images) == 1
+    assert state.images[0].mime_type == "image/png"
+    assert _B64_LINE not in state.full_text
+    assert "以上" in state.full_text
+
+
+def test_extract_insert_after_chars_correct() -> None:
+    prefix = "hello:\n"
+    text = f"{prefix}data:image/png;base64,{_B64_LONG}\nend"
+    state = _make_state(text)
+    FeishuBot._extract_text_base64_images(state)
+    assert len(state.images) == 1
+    assert state.images[0].insert_after_chars == len(prefix)
+
+
+def test_extract_multiple_images_in_order() -> None:
+    text = (
+        f"第一张：\ndata:image/png;base64,{_B64_LONG}\n"
+        f"第二张：\ndata:image/jpeg;base64,{'B' * 100 + '=='}\n"
+    )
+    state = _make_state(text)
+    FeishuBot._extract_text_base64_images(state)
+    assert len(state.images) == 2
+    assert state.images[0].mime_type == "image/png"
+    assert state.images[1].mime_type == "image/jpeg"
+    assert state.images[0].insert_after_chars < state.images[1].insert_after_chars
+
+
+def test_extract_idempotent_second_call_adds_nothing() -> None:
+    text = f"data:image/png;base64,{_B64_LONG}"
+    state = _make_state(text)
+    FeishuBot._extract_text_base64_images(state)
+    count_after_first = len(state.images)
+    FeishuBot._extract_text_base64_images(state)
+    assert len(state.images) == count_after_first  # no duplicates

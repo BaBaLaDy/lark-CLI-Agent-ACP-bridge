@@ -12,6 +12,7 @@ Key features over the previous version:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import sys
@@ -21,6 +22,7 @@ from typing import Any
 
 import lark_oapi as lark
 import structlog
+from acp import image_block
 from aiohttp import web
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
 from lark_oapi.api.im.v1 import (
@@ -61,6 +63,9 @@ except ImportError:
     AgentManager = None  # type: ignore[assignment,misc]
     WorkspaceStore = None  # type: ignore[assignment,misc]
     SessionStore = None  # type: ignore[assignment,misc]
+
+# Inbound attachment support — always available
+from ..media.attachment import AttachmentInfo, apply_attachment_policy, download_and_cache
 
 logger = structlog.get_logger()
 
@@ -214,6 +219,7 @@ class _ThrottledCardUpdater:
         except asyncio.CancelledError:
             return  # final_flush cancelled us; it will send the card itself
         if self._latest_state is not None:
+            await self._bot._upload_pending_images(self._latest_state)
             card = render_streaming_card(self._latest_state, show_tool_calls=self._show_tool_calls)
             await self._bot._update_card(self._card_message_id, card)
 
@@ -226,6 +232,7 @@ class _ThrottledCardUpdater:
             except asyncio.CancelledError:
                 pass
             self._pending_task = None
+        await self._bot._upload_pending_images(state, final=True)
         card = render_result_card(state, status=status, show_tool_calls=self._show_tool_calls)
         await self._bot._update_card(self._card_message_id, card)
 
@@ -280,7 +287,7 @@ class FeishuBot:
         self._shutdown_event = asyncio.Event()
         # Inbound message debounce: user_id → pending flush task / text buffer
         self._debounce_tasks: dict[str, asyncio.Task] = {}
-        self._debounce_texts: dict[str, list[tuple[str, str, str, str]]] = {}
+        self._debounce_texts: dict[str, list[tuple[str, str, str, str, list]]] = {}
         # Each entry: (message_id, text, chat_id, chat_type)
 
     # ------------------------------------------------------------------ #
@@ -496,6 +503,19 @@ class FeishuBot:
     # Dedup
     # ------------------------------------------------------------------ #
 
+    def _has_pending_bot_turn(self, user_id: str, chat_id: str) -> bool:
+        """Return True if ``user_id`` has a pending debounced @bot turn in
+        ``chat_id`` waiting to be flushed.
+
+        Used in group chats to attach attachment-only follow-ups (which
+        Feishu sends as separate, mention-less messages) to the user's
+        currently-pending @bot turn.  Without this, group image/file
+        messages would be silently dropped because they fail the @mention
+        check on their own.
+        """
+        pending = self._debounce_texts.get(user_id) or []
+        return any(entry[2] == chat_id for entry in pending)
+
     def _is_duplicate(self, message_id: str) -> bool:
         """Return True if this message_id was already seen within the TTL window."""
         now = time.monotonic()
@@ -513,20 +533,79 @@ class FeishuBot:
 
     async def _handle_message_event(self, event: dict[str, Any]) -> None:
         message = event.get("message", {})
-        if message.get("message_type") != "text":
+        message_type = message.get("message_type", "")
+        content_json = message.get("content", "{}")
+        message_id = message.get("message_id", "")
+        chat_type_log = message.get("chat_type", "")
+
+        # Log every inbound message so we can tell at a glance whether the
+        # webhook is delivering image/file events at all.
+        logger.info(
+            "inbound-message",
+            message_id=message_id,
+            message_type=message_type,
+            chat_type=chat_type_log,
+        )
+
+        # --- Parse message by type ---
+        attachments: list[AttachmentInfo] = []
+        if message_type == "text":
+            text = self._extract_text(content_json)
+        elif message_type in ("image", "file"):
+            text = ""
+            attachments, attach_reason = await self._resolve_message_attachments(
+                message_id, message_type, content_json
+            )
+            if not attachments:
+                # Tell the user the *exact* reason — silent failure here was
+                # the #1 source of "私聊发图无反应" reports.  Reasons we surface:
+                # API errors (code+msg from Feishu), policy rejection
+                # (unsupported MIME, too big), or empty/malformed payloads.
+                logger.warning(
+                    "attachment-resolve-empty",
+                    message_id=message_id,
+                    message_type=message_type,
+                    reason=attach_reason,
+                )
+                await self._reply_message(
+                    message_id,
+                    f"⚠️ 附件处理失败：{attach_reason or '未知原因'}\n\n"
+                    "常见原因：\n"
+                    "• 飞书应用缺少 `im:resource` 权限（已授予后需重新发布版本）\n"
+                    "• 图片/文件 MIME 类型不在白名单（仅支持 jpeg/png/webp/gif；文件类型见 attachment.py）\n"
+                    "• 文件超过 25MB\n"
+                    "• tenant_access_token 已过期或 app_id/app_secret 配置错误",
+                )
+                return
+        elif message_type == "post":
+            text, post_image_keys = self._extract_post_content(content_json)
+            # Download every image embedded in the post and pass them as
+            # attachments — otherwise "图+文" messages would lose the image.
+            if post_image_keys:
+                attachments = await self._download_post_images(
+                    message_id, post_image_keys
+                )
+        else:
+            # sticker / audio / video / etc. — silently skip
+            logger.debug("inbound-message-unsupported-type", message_type=message_type)
             return
 
-        text = self._extract_text(message.get("content", "{}"))
-        if not text:
+        if not text and not attachments:
             return
+        if not text and attachments:
+            text = "请看下面的附件。"
 
         sender = event.get("sender", {}).get("sender_id", {})
         user_id = sender.get("user_id") or sender.get("open_id") or "unknown"
-        message_id = message.get("message_id", "")
         chat_id = message.get("chat_id", "")
         chat_type = message.get("chat_type", "p2p")
 
-        # Group mention check: in non-DM chats, only respond if bot is @mentioned
+        # Group mention check: in non-DM chats, only respond if bot is @mentioned.
+        # Image/file messages from Feishu carry no `mentions` array of their own,
+        # so an attachment sent right after an @bot text would otherwise be
+        # silently dropped.  Treat such an attachment as part of the user's
+        # currently-pending @bot turn when the same user has an in-flight
+        # debounce buffer for this chat.
         if chat_type != "p2p":
             bot_open_id = await self._get_bot_open_id()
             mentions = message.get("mentions", [])
@@ -536,12 +615,26 @@ class FeishuBot:
                 if bot_open_id
             )
             if not bot_mentioned:
-                # Silently ignore messages where bot is not @mentioned
-                return
+                attaches_to_pending_turn = (
+                    message_type in ("image", "file")
+                    and attachments
+                    and self._has_pending_bot_turn(user_id, chat_id)
+                )
+                if not attaches_to_pending_turn:
+                    # Silently ignore messages where bot is not @mentioned
+                    logger.debug(
+                        "group-message-skipped-no-mention",
+                        message_type=message_type,
+                        has_attachments=bool(attachments),
+                    )
+                    return
             # Strip bot @mention placeholders from text
-            text = self._strip_bot_mentions(text, mentions, bot_open_id)
-            if not text:
+            if text:
+                text = self._strip_bot_mentions(text, mentions, bot_open_id)
+            if not text and not attachments:
                 return
+            if not text and attachments:
+                text = "请看下面的附件。"
 
         # 1. Dedup — drop replays from WebSocket reconnect
         if self._is_duplicate(message_id):
@@ -557,7 +650,7 @@ class FeishuBot:
         debounce_ms = self._settings.debounce_ms
         if debounce_ms > 0:
             self._debounce_texts.setdefault(user_id, []).append(
-                (message_id, text, chat_id, chat_type)
+                (message_id, text, chat_id, chat_type, attachments)
             )
             # Cancel any pending flush — we'll restart the timer with the new message.
             old = self._debounce_tasks.pop(user_id, None)
@@ -570,7 +663,9 @@ class FeishuBot:
             return
 
         # No debounce: dispatch immediately.
-        await self._dispatch_to_agent(user_id, [(message_id, text, chat_id, chat_type)])
+        await self._dispatch_to_agent(
+            user_id, [(message_id, text, chat_id, chat_type, attachments)]
+        )
 
     # ------------------------------------------------------------------ #
     # Message debounce flush
@@ -593,18 +688,49 @@ class FeishuBot:
     # ------------------------------------------------------------------ #
 
     async def _dispatch_to_agent(
-        self, user_id: str, entries: list[tuple[str, str, str, str]],
+        self, user_id: str, entries: list[tuple[str, str, str, str, list]],
     ) -> None:
-        """Run the agent for the given (message_id, text, chat_id, chat_type) entries.
+        """Run the agent for the given (message_id, text, chat_id, chat_type, attachments) entries.
 
         When multiple entries are present (debounced batch), their texts are
-        joined with newlines and the last message_id is used for the reply card.
+        joined with newlines, all attachments are merged, and the last
+        message_id is used for the reply card.
         """
         if not entries:
             return
         # Use the last message as the "primary" for the reply card.
-        message_id, _, chat_id, chat_type = entries[-1]
-        combined_text = "\n".join(text for _, text, _, _ in entries)
+        message_id, _, chat_id, chat_type, _ = entries[-1]
+        combined_text = "\n".join(text for _, text, _, _, _ in entries)
+
+        # Collect all attachments from every entry in the batch.
+        all_attachments: list[AttachmentInfo] = []
+        for entry in entries:
+            all_attachments.extend(entry[4])
+
+        # Build ACP extra_blocks for images and file-notes for text files.
+        extra_blocks: list[Any] = []
+        file_notes: list[str] = []
+        for att in all_attachments:
+            if att.decision != "accepted":
+                continue
+            if att.kind == "image":
+                try:
+                    b64 = base64.b64encode(Path(att.abs_path).read_bytes()).decode()
+                    extra_blocks.append(image_block(b64, att.mime_type))
+                except Exception as exc:
+                    logger.warning("image-block-read-error", path=att.abs_path, error=str(exc))
+            else:
+                size_kb = att.size // 1024
+                name = att.original_name or att.file_hash
+                file_notes.append(
+                    f"[附件文件: {name} ({att.mime_type}, {size_kb}KB) 本地路径: {att.abs_path}]"
+                )
+        if file_notes:
+            combined_text = (
+                combined_text + "\n" + "\n".join(file_notes)
+                if combined_text
+                else "\n".join(file_notes)
+            )
 
         # Concurrent-run guard — one run per user at a time
         existing_task = self._active_tasks.get(user_id)
@@ -624,7 +750,11 @@ class FeishuBot:
 
         # Launch agent run as a cancellable task
         task = asyncio.create_task(
-            self._run_agent(user_id, combined_text, card_message_id, message_id, reaction_id, chat_id, chat_type),
+            self._run_agent(
+                user_id, combined_text, card_message_id, message_id,
+                reaction_id, chat_id, chat_type,
+                extra_blocks=extra_blocks or None,
+            ),
             name=f"agent-run:{user_id}",
         )
         self._active_tasks[user_id] = task
@@ -646,6 +776,7 @@ class FeishuBot:
         reaction_id: str | None,
         chat_id: str = "",
         chat_type: str = "p2p",
+        extra_blocks: list[Any] | None = None,
     ) -> None:
         """Run the ACP agent, pushing throttled card updates as it streams."""
         settings = self._settings
@@ -700,6 +831,9 @@ class FeishuBot:
         # --- Try to resume prior session before first message ------------
         await self._try_resume_prior_session(user_id, agent_name, chat_id, chat_type)
 
+        # --- Prepend bridge context so the agent knows it's behind Feishu ---
+        actual_text = self._wrap_with_bridge_context(actual_text, user_id, chat_type)
+
         # --- Run with timeout and cancellation handling -----------------
         try:
             if self._agent_manager is not None and agent_name:
@@ -710,16 +844,18 @@ class FeishuBot:
                         user_id=user_id,
                         on_state_change=on_state_change,
                         on_session_reset=on_session_reset,
+                        extra_blocks=extra_blocks,
                     ),
                     timeout=float(settings.idle_timeout_seconds),
                 )
             else:
                 state = await asyncio.wait_for(
                     self.codex_bridge.chat(
-                        message=text,
+                        message=actual_text,
                         user_id=user_id,
                         on_state_change=on_state_change,
                         on_session_reset=on_session_reset,
+                        extra_blocks=extra_blocks,
                     ),
                     timeout=float(settings.idle_timeout_seconds),
                 )
@@ -1397,7 +1533,9 @@ class FeishuBot:
             except Exception as exc:
                 logger.warning("resume-session-failed", session_id=session_id, error=str(exc))
                 await self._send_card(chat_id, simple_text_card(
-                    f"❌ 恢复失败: {exc}\n该会话可能已过期或 agent 不支持恢复。", "🔁"
+                    f"❌ 恢复失败: {exc}\n\n"
+                    "该会话可能已过期、agent 进程已重启，或 agent 不支持会话恢复。\n"
+                    "请发送一条新消息开始新会话。", "🔁"
                 ))
 
         elif cmd == "ws.list":
@@ -1441,6 +1579,36 @@ class FeishuBot:
             logger.warning("unknown-card-action", cmd=cmd)
 
     # ------------------------------------------------------------------ #
+    # Bridge context for agent prompts
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _wrap_with_bridge_context(text: str, user_id: str, chat_type: str) -> str:
+        """Prepend a short system context so the agent knows it's behind Feishu.
+
+        Tells the agent:
+        - It is talking to a user via Feishu bridge
+        - Replies are sent automatically — do NOT call any Feishu API
+        - To share images, save to a local file and output base64
+
+        The context is wrapped in a clearly-delimited block so the agent
+        can distinguish it from the user's actual message.
+        """
+        scope = "群聊" if chat_type != "p2p" else "私聊"
+        context = (
+            "<bridge_context>\n"
+            "你正在通过飞书 bridge 与用户对话。\n"
+            f"- 会话类型：{scope}\n"
+            f"- 用户 ID：{user_id}\n"
+            "- 你的回复由 bridge 自动发送回用户，你不需要调用任何飞书 API（不要用 lark-cli、不要发飞书消息）。\n"
+            "- 如果需要给用户发送图片：将图片保存为本地文件（绝对路径，支持 png/jpg/jpeg/gif/webp），然后在回复文本中**单独一行**输出 `[image: 绝对路径]` 标记（例如 `[image: /tmp/chart.png]`）。**不要**输出 base64 内容。bridge 会自动读取文件、上传到飞书并渲染为图片，标记会从文本中移除。\n"
+            "- 如果需要给用户发送文件：将文件保存到本地，然后在回复中给出文件路径。\n"
+            "- 回复要求：直接用纯文本，不要 markdown 格式（不要 ** __ # - * > ` 之类的标记），飞书消息框不渲染 markdown。\n"
+            "</bridge_context>\n\n"
+        )
+        return context + text
+
+    # ------------------------------------------------------------------ #
     # Lark API helpers (best-effort; log errors, never raise to caller)
     # ------------------------------------------------------------------ #
 
@@ -1450,6 +1618,148 @@ class FeishuBot:
             return str(json.loads(content).get("text", "")).strip()
         except json.JSONDecodeError:
             return ""
+
+    async def _resolve_message_attachments(
+        self,
+        message_id: str,
+        message_type: str,
+        content_json: str,
+    ) -> tuple[list[AttachmentInfo], str | None]:
+        """Download and policy-filter an inbound image or file message.
+
+        Returns ``(accepted_attachments, failure_reason)``.  ``failure_reason``
+        is set when the download or policy step rejected the attachment so
+        the caller can surface a precise error to the user (instead of a
+        vague "下载失败").
+        """
+        try:
+            content = json.loads(content_json)
+        except json.JSONDecodeError:
+            return [], "content is not valid JSON"
+
+        if message_type == "image":
+            file_key = content.get("image_key", "")
+            file_name = f"{file_key}.jpg"
+        else:  # "file"
+            file_key = content.get("file_key", "")
+            file_name = content.get("file_name", file_key)
+
+        if not file_key:
+            return [], f"missing file_key in {message_type} content"
+
+        cache_dir = Path.home() / ".lark-acp-bridge" / "media"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        loop = asyncio.get_running_loop()
+        info, dl_reason = await download_and_cache(
+            self.client, message_id, message_type, file_key,
+            file_name, str(cache_dir), loop,
+        )
+        if info is None:
+            return [], dl_reason or "unknown download error"
+
+        decided = apply_attachment_policy([info])
+        accepted = [a for a in decided if a.decision == "accepted"]
+        if not accepted:
+            rejected = decided[0]
+            return [], f"policy rejected: {rejected.rejection_reason} (mime={rejected.mime_type}, size={rejected.size})"
+
+        return accepted, None
+
+    async def _download_post_images(
+        self,
+        message_id: str,
+        image_keys: list[str],
+    ) -> list[AttachmentInfo]:
+        """Download every image_key embedded in a post message and policy-
+        filter the results.  Returns only accepted attachments — failures are
+        logged but do not block the rest of the message from being processed.
+        """
+        cache_dir = Path.home() / ".lark-acp-bridge" / "media"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        loop = asyncio.get_running_loop()
+
+        candidates: list[AttachmentInfo] = []
+        for key in image_keys:
+            info, reason = await download_and_cache(
+                self.client, message_id, "image", key,
+                f"{key}.jpg", str(cache_dir), loop,
+            )
+            if info is not None:
+                candidates.append(info)
+            else:
+                logger.warning(
+                    "post-image-download-failed",
+                    image_key=key,
+                    message_id=message_id,
+                    reason=reason,
+                )
+        return [a for a in apply_attachment_policy(candidates) if a.decision == "accepted"]
+
+    @staticmethod
+    def _extract_post_content(content_json: str) -> tuple[str, list[str]]:
+        """Extract plain text and embedded image_keys from a ``post`` message.
+
+        Post (rich-text) messages from Feishu can interleave text, mentions,
+        images, and other media inside ``content[][]``.  We pull the text out
+        for the agent prompt and collect every embedded ``image_key`` as a
+        flat list — the caller is responsible for downloading and policy-
+        filtering them through ``download_and_cache``.
+
+        Example post payload::
+
+            {"zh_cn": {"content": [[
+                {"tag": "text", "text": "look at this"},
+                {"tag": "img",  "image_key": "img_v3_..."}
+            ]]}}
+        """
+        try:
+            data = json.loads(content_json)
+            # Feishu sends post content in two shapes depending on the client:
+            #   WebSocket: {"title":"...","content":[[...]]}   (no language wrapper)
+            #   HTTP API:  {"zh_cn":{"title":"...","content":[[...]]}}
+            if "content" in data:
+                lang_content = data
+            else:
+                lang_content = next(
+                    (v for v in data.values() if isinstance(v, dict)),
+                    {},
+                )
+            text_parts: list[str] = []
+            image_keys: list[str] = []
+            if lang_content.get("title"):
+                text_parts.append(lang_content["title"])
+            for line in lang_content.get("content", []):
+                # Feishu post content can be list[list[dict]] (standard bot
+                # format) or list[dict] (flat, as sent by some Feishu clients
+                # when a user mixes text and images in one message).  Handle
+                # both by normalising to a flat list of element dicts.
+                if isinstance(line, dict):
+                    elements = [line]
+                elif isinstance(line, list):
+                    elements = [e for e in line if isinstance(e, dict)]
+                else:
+                    continue
+                for el in elements:
+                    tag = el.get("tag")
+                    if tag == "text":
+                        text_parts.append(el.get("text", ""))
+                    elif tag == "at":
+                        text_parts.append(el.get("user_name", ""))
+                    elif tag in ("img", "media"):
+                        # ``img`` carries image_key; ``media`` carries file_key
+                        # (we only extract images here — files in posts are rare).
+                        key = el.get("image_key") or el.get("file_key") or ""
+                        if key:
+                            image_keys.append(key)
+            return " ".join(p for p in text_parts if p).strip(), image_keys
+        except Exception as exc:
+            logger.warning(
+                "post-content-parse-error",
+                error=str(exc),
+                raw_content=content_json[:500],  # log first 500 chars for diagnosis
+            )
+            return "", []
 
     @staticmethod
     def _strip_bot_mentions(text: str, mentions: list[dict[str, Any]], bot_open_id: str | None) -> str:
@@ -1542,6 +1852,310 @@ class FeishuBot:
         else:
             logger.info("card-updated", message_id=message_id)
 
+    async def _upload_pending_images(self, state: SessionState, *, final: bool = False) -> None:
+        """Upload any un-uploaded images in ``state`` to Feishu and fill their ``img_key``.
+
+        Two image sources are handled:
+
+        1. **Path markers** in text (``[image: /abs/path]``) — extracted on
+           every call (streaming and final).  Cheap & safe: the marker is a
+           short fixed-shape token, so partial-flush extraction is fine.
+        2. **Inline base64** in text (legacy ACP path) — extracted only on
+           ``final=True``, because base64 streams in incrementally and
+           partial blocks would decode to corrupt images.
+
+        Already-attempted images (``img_key`` is non-None — either a real key
+        or empty string for failures) are skipped.  Uploads use the SDK's
+        sync ``create()`` dispatched to a thread, since only that path
+        produces a correct multipart payload with ``filename=`` and
+        ``Content-Type:`` headers.
+        """
+        # --- Step 1: Extract images from text -----------------------------
+        # Path markers are cheap to extract incrementally; do it every call.
+        self._extract_text_image_paths(state)
+        # Base64 only on final flush (partial chunks decode to garbage).
+        if final:
+            self._extract_text_base64_images(state)
+
+        # --- Step 2: Upload all pending images -----------------------------
+        import base64
+        import io as _io
+        import os as _os
+        from lark_oapi.api.im.v1 import CreateImageRequest
+        from lark_oapi.api.im.v1.model import CreateImageRequestBody
+
+        # Map MIME type → filename so the multipart part has a proper
+        # ``filename=`` parameter (Feishu rejects the upload without it).
+        _MIME_TO_EXT = {
+            "image/png": "image.png",
+            "image/jpeg": "image.jpg",
+            "image/gif": "image.gif",
+            "image/webp": "image.webp",
+        }
+
+        for img in state.images:
+            if img.img_key is not None:
+                continue  # already uploaded or already failed ("")
+            try:
+                # Resolve the bytes either from a local file or inline base64.
+                if img.local_path:
+                    with open(img.local_path, "rb") as fh:
+                        raw = fh.read()
+                    # Prefer the real filename so Feishu sees a sensible name.
+                    filename = _os.path.basename(img.local_path) or _MIME_TO_EXT.get(
+                        img.mime_type, "image.bin"
+                    )
+                else:
+                    # Pad to a multiple of 4 to tolerate base64 strings without trailing '='
+                    padded = img.data + '=' * (-len(img.data) % 4)
+                    raw = base64.b64decode(padded)
+                    filename = _MIME_TO_EXT.get(img.mime_type, "image.bin")
+
+                body = (
+                    CreateImageRequestBody.builder()
+                    .image_type("message")
+                    # Use a (filename, file, content_type) tuple so the SDK's
+                    # multipart encoder includes ``filename=`` and ``Content-Type:``
+                    # in the part headers — Feishu requires both.
+                    .image((filename, _io.BytesIO(raw), img.mime_type))  # type: ignore[arg-type]
+                    .build()
+                )
+                req = CreateImageRequest.builder().request_body(body).build()
+                # Use the SDK's sync create() (dispatched to a thread): it goes
+                # through ``parse_form_data`` + ``MultipartEncoder``, which is
+                # the only path that honors a (filename, file, ctype) tuple.
+                # The async ``acreate`` uses ``extract_files`` which only
+                # recognizes bare ``io.IOBase`` and silently drops tuples,
+                # producing an empty multipart body.
+                loop = asyncio.get_running_loop()
+                resp = await loop.run_in_executor(
+                    None, self.client.im.v1.image.create, req
+                )
+                if resp.success() and resp.data:
+                    img.img_key = resp.data.image_key
+                    logger.info(
+                        "image-uploaded",
+                        img_key=img.img_key,
+                        mime_type=img.mime_type,
+                        source="path" if img.local_path else "base64",
+                    )
+                else:
+                    logger.warning(
+                        "image-upload-failed",
+                        code=resp.code,
+                        msg=resp.msg,
+                        mime_type=img.mime_type,
+                        source="path" if img.local_path else "base64",
+                    )
+                    img.img_key = ""  # mark attempted so we don't retry
+            except Exception as exc:
+                logger.error("image-upload-error", error=str(exc), exc_info=True)
+                img.img_key = ""
+
+    @staticmethod
+    def _extract_text_image_paths(state: SessionState) -> None:
+        """Scan ``state.full_text`` for ``[image: /abs/path]`` markers, register
+        each as a path-based ``ImageInfo``, and strip the marker from the
+        visible text.
+
+        Idempotent: tracks already-seen paths via the ``local_path`` field of
+        existing ``state.images`` entries, so calling on every streaming
+        flush does not duplicate registrations.
+        """
+        import os as _os
+        import re
+
+        full = state.full_text
+        if not full or "[image:" not in full and "[image：" not in full:
+            return
+
+        # Match `[image: /path/to/file.png]` — half/full-width colon, any
+        # extension, allow spaces and Windows drive letters.  Keep the path
+        # capture lazy and stop at the closing bracket.
+        pattern = re.compile(
+            r'\[image[:：]\s*([^\]\r\n]+?\.(?:png|jpe?g|gif|webp))\s*\]',
+            re.IGNORECASE,
+        )
+
+        # MIME inference by extension.
+        ext_to_mime = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+        }
+
+        seen_paths = {img.local_path for img in state.images if img.local_path}
+
+        matches: list[tuple[int, int, str, str]] = []  # start, end, mime, path
+        for m in pattern.finditer(full):
+            path = m.group(1).strip().strip('"\'')
+            # Skip if we've already registered this path in a previous flush.
+            if path in seen_paths:
+                matches.append((m.start(), m.end(), "", ""))  # strip marker only
+                continue
+            if not _os.path.isabs(path) or not _os.path.isfile(path):
+                logger.warning("image-path-marker-invalid", path=path)
+                # Strip the marker anyway so the user doesn't see raw `[image: ...]`.
+                matches.append((m.start(), m.end(), "", ""))
+                continue
+            ext = _os.path.splitext(path)[1].lower()
+            mime = ext_to_mime.get(ext, "image/png")
+            matches.append((m.start(), m.end(), mime, path))
+            seen_paths.add(path)
+
+        if not matches:
+            return
+
+        # Rebuild text without markers, recording each new image's insertion offset.
+        from ..acp.client import ImageInfo
+
+        cleaned_parts: list[str] = []
+        prev_end = 0
+        new_images: list[ImageInfo] = []
+        for start, end, mime, path in matches:
+            cleaned_parts.append(full[prev_end:start])
+            insert_pos = sum(len(p) for p in cleaned_parts)
+            if path:  # newly-discovered file
+                new_images.append(
+                    ImageInfo(
+                        mime_type=mime,
+                        local_path=path,
+                        insert_after_chars=insert_pos,
+                    )
+                )
+            prev_end = end
+        cleaned_parts.append(full[prev_end:])
+        cleaned_text = "".join(cleaned_parts)
+
+        state.text_chunks.clear()
+        if cleaned_text:
+            state.text_chunks.append(cleaned_text)
+        state.images.extend(new_images)
+        if new_images:
+            logger.info(
+                "text-image-paths-extracted",
+                count=len(new_images),
+                paths=[i.local_path for i in new_images],
+            )
+
+    @staticmethod
+    def _extract_text_base64_images(state: SessionState) -> None:
+        """Scan ``state.full_text`` for inline base64 image data and extract them.
+
+        Detects three patterns:
+        1. Data URIs: ``data:image/<fmt>;base64,<data>``
+        2. Code blocks: `` ```base64 ... ``` `` or `` ``` ... ``` `` containing only base64
+        3. Standalone lines: a single line of pure base64 chars, ≥100 chars long
+
+        Each detected image is added to ``state.images`` with the correct
+        ``insert_after_chars`` position, and the base64 text is stripped
+        from ``state.text_chunks`` so it doesn't appear as raw text in the card.
+        """
+        import re
+
+        full = state.full_text
+        if not full:
+            return
+
+        # Minimum base64 length to avoid false positives (~75 bytes of image data)
+        MIN_B64 = 100
+
+        # Pattern 1: data:image/xxx;base64,<data>
+        p_data_uri = re.compile(
+            r'data:image/(png|jpeg|jpg|gif|webp);base64,([A-Za-z0-9+/=\s]{' + str(MIN_B64) + r',})'
+        )
+        # Pattern 2: code block with base64 content
+        p_code_block = re.compile(
+            r'```(?:base64|image)?\s*\n([A-Za-z0-9+/=\s]{' + str(MIN_B64) + r',})\n```'
+        )
+        # Pattern 3: standalone line of pure base64 (entire line is base64 chars)
+        p_standalone = re.compile(
+            r'^([A-Za-z0-9+/]{' + str(MIN_B64) + r',}[A-Za-z0-9+/=]*)$',
+            re.MULTILINE,
+        )
+        # Pattern 4: multi-line standard base64 block (each line ~76 chars, ≥3 lines)
+        # Handles the case where agent outputs standard base64 with line wrapping.
+        p_multiline = re.compile(
+            r'((?:[A-Za-z0-9+/]{60,76}\n){2,}[A-Za-z0-9+/]{1,76}={0,2})',
+            re.MULTILINE,
+        )
+
+        # Collect all matches with (start, end, mime, b64data)
+        matches: list[tuple[int, int, str, str]] = []
+
+        for m in p_data_uri.finditer(full):
+            mime = f"image/{m.group(1)}"
+            if mime == "image/jpg":
+                mime = "image/jpeg"
+            b64 = re.sub(r'\s+', '', m.group(2))
+            matches.append((m.start(), m.end(), mime, b64))
+
+        for m in p_code_block.finditer(full):
+            b64 = re.sub(r'\s+', '', m.group(1))
+            # Skip if this region overlaps with a data URI match
+            if any(s <= m.start() < e for s, e, _, _ in matches):
+                continue
+            matches.append((m.start(), m.end(), "image/png", b64))
+
+        for m in p_standalone.finditer(full):
+            # Skip if this region overlaps with an earlier match
+            if any(s <= m.start() < e for s, e, _, _ in matches):
+                continue
+            matches.append((m.start(), m.end(), "image/png", m.group(1)))
+
+        for m in p_multiline.finditer(full):
+            if any(s <= m.start() < e for s, e, _, _ in matches):
+                continue
+            b64 = re.sub(r'\s+', '', m.group(1))
+            if len(b64) >= MIN_B64:
+                matches.append((m.start(), m.end(), "image/png", b64))
+
+        if not matches:
+            return
+
+        # Sort by position (start offset)
+        matches.sort(key=lambda x: x[0])
+
+        # Build cleaned text and ImageInfo list, processing matches in order
+        from ..acp.client import ImageInfo
+
+        cleaned_parts: list[str] = []
+        prev_end = 0
+        new_images: list[ImageInfo] = []
+
+        for start, end, mime, b64_data in matches:
+            # Text before this image
+            cleaned_parts.append(full[prev_end:start])
+            # Record insert position = length of cleaned text so far
+            insert_pos = sum(len(p) for p in cleaned_parts)
+            new_images.append(
+                ImageInfo(
+                    data=b64_data,
+                    mime_type=mime,
+                    insert_after_chars=insert_pos,
+                )
+            )
+            prev_end = end
+
+        # Remaining text after last image
+        cleaned_parts.append(full[prev_end:])
+        cleaned_text = "".join(cleaned_parts)
+
+        # Replace text_chunks with the cleaned text (single chunk)
+        state.text_chunks.clear()
+        if cleaned_text:
+            state.text_chunks.append(cleaned_text)
+
+        # Add extracted images to state
+        state.images.extend(new_images)
+        logger.info(
+            "text-base64-images-extracted",
+            count=len(new_images),
+            text_len=len(cleaned_text),
+        )
+
     async def _add_reaction(self, message_id: str, reaction_type: str) -> str | None:
         request = (
             CreateMessageReactionRequest.builder()
@@ -1633,14 +2247,19 @@ class FeishuBot:
             return
 
         # 5. Fetch comment text and quoted selection from Feishu.
-        question, quote = await self._fetch_comment_text(file_token, file_type, comment_id, reply_id)
+        question, quote, is_whole, target_reply_id = await self._fetch_comment_text(
+            file_token, file_type, comment_id, reply_id
+        )
         if not question:
             logger.info("doc-comment-skip", reason="empty-question")
             return
 
         # 6. Build the agent prompt.
-        #    is_whole=True when there is no reply_id (top-level comment on the whole doc).
-        prompt = _build_comment_prompt(file_token, file_type, question, quote, is_whole=not reply_id)
+        #    is_whole comes from the API's is_whole field (reliable) rather
+        #    than ``not reply_id`` (only correct when there is no thread).
+        prompt = _build_comment_prompt(
+            file_token, file_type, question, quote, is_whole=is_whole
+        )
 
         # 7. Use operator's open_id as the agent user scope (same key as IM messages).
         user_id = operator_open_id or "doc-comment-user"
@@ -1656,7 +2275,9 @@ class FeishuBot:
             answer = answer[: self._COMMENT_REPLY_MAX_CHARS - 1] + "…"
 
         # 10. Post the reply in the comment thread.
-        await self._post_comment_reply(file_token, file_type, comment_id, answer)
+        await self._post_comment_reply(
+            file_token, file_type, comment_id, answer, is_whole=is_whole
+        )
 
     async def _fetch_comment_text(
         self,
@@ -1664,11 +2285,16 @@ class FeishuBot:
         file_type: str,
         comment_id: str,
         reply_id: str | None,
-    ) -> tuple[str, str | None]:
-        """Fetch the comment question text and quoted selection from Feishu.
+    ) -> tuple[str, str | None, bool, str | None]:
+        """Fetch the comment question text, quote, is_whole flag, and target reply.
 
-        Returns (question, quote) where quote is the selected text for inline
-        comments (or None for whole-doc comments).
+        Returns (question, quote, is_whole, target_reply_id).
+
+        Mirrors the TS SDK's CommentSurface.fetch: tries ``file_comment.get``
+        first; on ``1069307`` (which some comment types return despite read
+        access) falls back to paginated ``file_comment.list`` and scans for the
+        matching ``comment_id``.  A genuine no-access error propagates as an
+        empty question.
         """
         try:
             from lark_oapi.api.drive.v1 import GetFileCommentRequest
@@ -1681,53 +2307,132 @@ class FeishuBot:
                 .build()
             )
             response = self.client.drive.v1.file_comment.get(request)
-            if not response.success():
+            if response.success():
+                comment = response.data.comment if response.data else None
+                if not comment:
+                    return "", None, False, None
+                return self._extract_comment_fields(comment, reply_id)
+
+            # .get failed — only fall back on 1069307.
+            if response.code != 1069307:
                 logger.warning("fetch-comment-failed", code=response.code, msg=response.msg)
-                return "", None
+                return "", None, False, None
 
-            comment = response.data.comment if response.data else None
-            if not comment:
-                return "", None
-
-            # Extract quote (selected text for inline comments).
-            quote: str | None = getattr(comment, "quote", None)
-
-            # Locate the reply that triggered the event (or fall back to the last reply).
-            reply_list = getattr(comment, "reply_list", None)
-            replies: list = getattr(reply_list, "replies", []) or [] if reply_list else []
-
-            target_reply = None
-            if reply_id and replies:
-                target_reply = next(
-                    (r for r in replies if getattr(r, "reply_id", None) == reply_id),
-                    None,
-                )
-            if target_reply is None and replies:
-                target_reply = replies[-1]
-            if target_reply is None:
-                return "", quote
-
-            # Extract text content from reply elements (text_run / docs_link only).
-            content = getattr(target_reply, "content", None)
-            elements: list = getattr(content, "elements", []) or [] if content else []
-            parts: list[str] = []
-            for el in elements:
-                el_type = getattr(el, "type", "")
-                if el_type == "text_run":
-                    text_run = getattr(el, "text_run", None)
-                    if text_run:
-                        parts.append(getattr(text_run, "text", "") or "")
-                elif el_type == "docs_link":
-                    docs_link = getattr(el, "docs_link", None)
-                    if docs_link:
-                        parts.append(getattr(docs_link, "url", "") or "")
-                # "person" elements (the @bot mention itself) are intentionally skipped.
-            question = "".join(parts).strip()
-            return question, quote
+            # Some comment types return 1069307 on .get despite read access.
+            # Fall back to paginated .list and scan for the matching comment_id.
+            logger.info("fetch-comment-get-failed-fallback-list", code=response.code)
+            return await self._fetch_comment_via_list(
+                file_token, file_type, comment_id, reply_id
+            )
 
         except Exception as exc:
             logger.error("fetch-comment-error", error=str(exc), exc_info=True)
-            return "", None
+            return "", None, False, None
+
+    async def _fetch_comment_via_list(
+        self,
+        file_token: str,
+        file_type: str,
+        comment_id: str,
+        reply_id: str | None,
+    ) -> tuple[str, str | None, bool, str | None]:
+        """Paginate ``file_comment.list`` looking for *comment_id*.
+
+        Returns the same four-tuple as ``_fetch_comment_text``.  If the list
+        API also fails with ``1069307``, or the comment is not found after
+        exhausting all pages, logs a warning and returns empty values.
+        """
+        from lark_oapi.api.drive.v1 import ListFileCommentRequest
+
+        page_token: str | None = None
+        list_failed = False
+        while True:
+            req_builder = (
+                ListFileCommentRequest.builder()
+                .file_type(file_type)
+                .file_token(file_token)
+                .page_size(100)
+            )
+            if page_token:
+                req_builder = req_builder.page_token(page_token)
+            try:
+                list_resp = self.client.drive.v1.file_comment.list(req_builder.build())
+            except Exception as exc:
+                logger.error("fetch-comment-list-error", error=str(exc), exc_info=True)
+                break
+            if not list_resp.success():
+                if list_resp.code == 1069307:
+                    logger.warning("fetch-comment-no-access", comment_id=comment_id)
+                else:
+                    logger.warning(
+                        "fetch-comment-list-failed",
+                        code=list_resp.code,
+                        msg=list_resp.msg,
+                    )
+                list_failed = True
+                break
+
+            items = (list_resp.data.items or []) if list_resp.data else []
+            for item in items:
+                if getattr(item, "comment_id", None) == comment_id:
+                    return self._extract_comment_fields(item, reply_id)
+
+            data = list_resp.data
+            if not data or not getattr(data, "has_more", False):
+                break
+            page_token = getattr(data, "page_token", None)
+            if not page_token:
+                break
+
+        if not list_failed:
+            logger.warning("fetch-comment-not-found", comment_id=comment_id)
+        return "", None, False, None
+
+    @staticmethod
+    def _extract_comment_fields(
+        comment: Any,
+        reply_id: str | None,
+    ) -> tuple[str, str | None, bool, str | None]:
+        """Extract question text, quote, is_whole flag, and target reply from a comment.
+
+        Shared by the ``.get`` success path and the ``.list`` fallback.
+        """
+        quote: str | None = getattr(comment, "quote", None)
+        is_whole: bool = bool(getattr(comment, "is_whole", False))
+
+        reply_list = getattr(comment, "reply_list", None)
+        replies: list = (getattr(reply_list, "replies", []) or []) if reply_list else []
+
+        target_reply = None
+        if reply_id and replies:
+            target_reply = next(
+                (r for r in replies if getattr(r, "reply_id", None) == reply_id),
+                None,
+            )
+        if target_reply is None and replies:
+            target_reply = replies[-1]
+        if target_reply is None:
+            return "", quote, is_whole, None
+
+        target_reply_id = getattr(target_reply, "reply_id", None)
+
+        # Extract text content from reply elements (text_run / docs_link only).
+        content = getattr(target_reply, "content", None)
+        elements: list = (getattr(content, "elements", []) or []) if content else []
+        parts: list[str] = []
+        for el in elements:
+            el_type = getattr(el, "type", "")
+            if el_type == "text_run":
+                text_run = getattr(el, "text_run", None)
+                if text_run:
+                    parts.append(getattr(text_run, "text", "") or "")
+            elif el_type == "docs_link":
+                docs_link = getattr(el, "docs_link", None)
+                if docs_link:
+                    parts.append(getattr(docs_link, "url", "") or "")
+            # "person" elements (the @bot mention itself) are intentionally skipped.
+        question = "".join(parts).strip()
+        return question, quote, is_whole, target_reply_id
 
     async def _run_agent_for_comment(self, user_id: str, prompt: str) -> str:
         """Run the ACP agent for a doc comment and return the final text answer."""
@@ -1773,10 +2478,22 @@ class FeishuBot:
         file_type: str,
         comment_id: str,
         text: str,
+        *,
+        is_whole: bool = False,
     ) -> None:
-        """Post a plain-text reply to a doc comment thread via drive.v1.file_comment.create."""
+        """Post a plain-text reply to a doc comment.
+
+        Inline comments (``is_whole=False``) are answered in-thread via
+        ``file_comment_reply.create``.  Whole-document comments cannot accept
+        in-thread replies, so we fall back to ``file_comment.create`` which
+        posts a fresh top-level comment.
+
+        If the in-thread probe on an inline comment unexpectedly returns
+        ``1069302`` (Feishu treats it as whole-doc), we silently fall back
+        to the create path.
+        """
+        # Shared text_run content used by both API paths.
         try:
-            from lark_oapi.api.drive.v1 import CreateFileCommentRequest
             from lark_oapi.api.drive.v1.model import (
                 FileComment,
                 FileCommentReply,
@@ -1786,18 +2503,80 @@ class FeishuBot:
                 TextRun,
             )
 
+            reply_content = (
+                ReplyContent.builder()
+                .elements([
+                    ReplyElement.builder()
+                    .type("text_run")
+                    .text_run(TextRun.builder().text(text).build())
+                    .build()
+                ])
+                .build()
+            )
+
+            # 1. Inline comment → try in-thread reply first.
+            if not is_whole:
+                try:
+                    from lark_oapi.api.drive.v1 import CreateFileCommentReplyRequest
+                    from lark_oapi.api.drive.v1.model import (
+                        CreateFileCommentReplyRequestBody,
+                    )
+
+                    body = (
+                        CreateFileCommentReplyRequestBody.builder()
+                        .content(reply_content)
+                        .build()
+                    )
+                    request = (
+                        CreateFileCommentReplyRequest.builder()
+                        .file_type(file_type)
+                        .file_token(file_token)
+                        .comment_id(comment_id)
+                        .request_body(body)
+                        .build()
+                    )
+                    response = self.client.drive.v1.file_comment_reply.create(request)
+                    if response.success():
+                        logger.info(
+                            "post-comment-reply-sent",
+                            file_token=file_token,
+                            comment_id=comment_id,
+                            via="reply",
+                        )
+                        return
+                    if response.code == 1069302:
+                        # Whole-doc comment exposed as inline — fall through.
+                        logger.info(
+                            "post-comment-reply-fallback-to-create",
+                            code=response.code,
+                            file_token=file_token,
+                            comment_id=comment_id,
+                        )
+                        # fall through to create path below
+                    else:
+                        logger.error(
+                            "post-comment-reply-failed",
+                            code=response.code,
+                            msg=response.msg,
+                            file_token=file_token,
+                            comment_id=comment_id,
+                        )
+                        return
+                except Exception as exc:
+                    logger.error(
+                        "post-comment-reply-error",
+                        error=str(exc),
+                        exc_info=True,
+                        via="reply",
+                    )
+                    return
+
+            # 2. Whole-doc path (or 1069302 fallback): post a fresh top-level comment.
+            from lark_oapi.api.drive.v1 import CreateFileCommentRequest
+
             reply = (
                 FileCommentReply.builder()
-                .content(
-                    ReplyContent.builder()
-                    .elements([
-                        ReplyElement.builder()
-                        .type("text_run")
-                        .text_run(TextRun.builder().text(text).build())
-                        .build()
-                    ])
-                    .build()
-                )
+                .content(reply_content)
                 .build()
             )
             body = (
@@ -1820,9 +2599,15 @@ class FeishuBot:
                     msg=response.msg,
                     file_token=file_token,
                     comment_id=comment_id,
+                    via="create",
                 )
             else:
-                logger.info("post-comment-reply-sent", file_token=file_token, comment_id=comment_id)
+                logger.info(
+                    "post-comment-reply-sent",
+                    file_token=file_token,
+                    comment_id=comment_id,
+                    via="create",
+                )
         except Exception as exc:
             logger.error("post-comment-reply-error", error=str(exc), exc_info=True)
 

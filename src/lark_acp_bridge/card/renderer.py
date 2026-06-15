@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from lark_acp_bridge.acp.client import SessionState
+from lark_acp_bridge.acp.client import ImageInfo, SessionState
 
 MAX_STREAMING_TEXT_CHARS = 4000
 MAX_FINAL_TEXT_CHARS = 6000
@@ -78,10 +78,16 @@ def render_streaming_card(state: SessionState, show_tool_calls: bool = True) -> 
             )
         )
 
-    # 2. Streaming text content
+    # 2. Streaming text content (interleaved with uploaded images)
     text = state.full_text.strip()
-    if text:
-        elements.append(_markdown(_truncate(text, MAX_STREAMING_TEXT_CHARS)))
+    if text or any(img.img_key for img in state.images):
+        elements.extend(
+            _build_content_elements(
+                state,
+                max_chars=MAX_STREAMING_TEXT_CHARS,
+                sanitize_base64=True,
+            )
+        )
 
     # 3. Tool calls in progress
     if show_tool_calls and state.tool_calls:
@@ -117,10 +123,13 @@ def render_result_card(
             )
         )
 
-    # 2. Final text content
+    # 2. Final text content (interleaved with uploaded images)
     text = state.full_text.strip()
-    if text:
-        elements.append(_markdown(_truncate(text, MAX_FINAL_TEXT_CHARS)))
+    has_images = any(img.img_key for img in state.images)
+    if text or has_images:
+        elements.extend(
+            _build_content_elements(state, max_chars=MAX_FINAL_TEXT_CHARS)
+        )
     else:
         # Terminal annotation for empty content
         elements.append(_terminal_annotation(state, status))
@@ -400,6 +409,118 @@ def _card(summary: str, elements: list[dict[str, Any]], streaming_mode: bool = F
 
 def _markdown(content: str) -> dict[str, Any]:
     return {"tag": "markdown", "content": content}
+
+
+def _img(img_key: str) -> dict[str, Any]:
+    return {
+        "tag": "img",
+        "img_key": img_key,
+        "alt": {"tag": "plain_text", "content": ""},
+        "scale_type": "crop_center",
+        "preview": True,
+    }
+
+
+_B64_PLACEHOLDER = "📷 _生成图片中…_"
+
+
+def _strip_base64_for_display(text: str) -> str:
+    """Replace inline base64 image data (complete or in-progress) with a
+    placeholder so streaming cards don't ship hundreds of KB of raw base64
+    to Feishu on every throttle tick.
+
+    The actual image extraction & upload happens later in ``final_flush``
+    via ``_extract_text_base64_images``.
+    """
+    import re
+
+    # data:image/...;base64,<long string>
+    text = re.sub(
+        r'data:image/(?:png|jpeg|jpg|gif|webp);base64,[A-Za-z0-9+/=\s]{40,}',
+        _B64_PLACEHOLDER,
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Multi-line base64 block (≥2 wrapped lines of ~60-76 chars)
+    text = re.sub(
+        r'(?:[A-Za-z0-9+/]{60,76}\n){2,}[A-Za-z0-9+/=]{1,76}',
+        _B64_PLACEHOLDER,
+        text,
+    )
+    # Code-block-wrapped base64
+    text = re.sub(
+        r'```(?:base64|image)?\s*\n[A-Za-z0-9+/=\s]{80,}\n```',
+        _B64_PLACEHOLDER,
+        text,
+    )
+    # Long standalone single line of pure base64 (one continuous run)
+    text = re.sub(
+        r'^[A-Za-z0-9+/]{120,}={0,2}$',
+        _B64_PLACEHOLDER,
+        text,
+        flags=re.MULTILINE,
+    )
+    return text
+
+
+def _build_content_elements(
+    state: SessionState,
+    max_chars: int,
+    *,
+    sanitize_base64: bool = False,
+) -> list[dict[str, Any]]:
+    """Interleave text chunks and uploaded images into card elements.
+
+    Images are placed at the character offset recorded in their
+    ``insert_after_chars`` field (captured when the agent emitted the image).
+    Only images with a non-empty ``img_key`` (i.e. successfully uploaded to
+    Feishu) are included; others are silently skipped.
+
+    The text is truncated to ``max_chars`` total.  Images whose insertion
+    point falls after the truncation boundary are dropped.
+
+    Falls back to a single ``_markdown`` element when there are no images,
+    preserving the previous behavior.
+    """
+    # Only consider images that were successfully uploaded.
+    inserted = sorted(
+        [img for img in state.images if img.img_key],
+        key=lambda i: i.insert_after_chars,
+    )
+
+    text = state.full_text
+    if sanitize_base64:
+        # During streaming we haven't extracted/uploaded inline base64 yet —
+        # replace it with a placeholder so the card stays small and readable.
+        text = _strip_base64_for_display(text)
+    truncated = _truncate(text, max_chars)
+    cut_len = len(truncated)
+    # Drop the trailing "…" sentinel added by _truncate when measuring bounds
+    # so image insertion points line up with the original text.
+    was_truncated = len(truncated) < len(text)
+
+    # Filter to images whose insertion point is within the visible range.
+    visible_images = [
+        img for img in inserted
+        if img.insert_after_chars <= (cut_len - (1 if was_truncated else 0))
+    ]
+
+    if not visible_images:
+        return [_markdown(truncated)] if truncated.strip() else []
+
+    elements: list[dict[str, Any]] = []
+    prev = 0
+    for img in visible_images:
+        cut = min(img.insert_after_chars, cut_len)
+        chunk = truncated[prev:cut]
+        if chunk.strip():
+            elements.append(_markdown(chunk))
+        elements.append(_img(img.img_key))  # type: ignore[arg-type]
+        prev = cut
+    tail = truncated[prev:]
+    if tail.strip():
+        elements.append(_markdown(tail))
+    return elements
 
 
 def _note(content: str) -> dict[str, Any]:

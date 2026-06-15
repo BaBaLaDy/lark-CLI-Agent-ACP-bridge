@@ -135,6 +135,7 @@ class TestCodexACPBridge:
                 session_id="session-auto",
                 on_text=None,
                 on_state_change=None,
+                extra_blocks=None,
             )
 
     @pytest.mark.asyncio

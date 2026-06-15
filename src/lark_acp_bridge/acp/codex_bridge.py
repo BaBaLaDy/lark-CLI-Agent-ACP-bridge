@@ -6,7 +6,7 @@ import asyncio
 import sys
 from collections.abc import Callable
 from shutil import which
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -75,6 +75,11 @@ class CodexACPBridge:
         return self._client is not None
 
     @property
+    def is_connected(self) -> bool:
+        """Return True if the bridge is running and the ACP connection is alive."""
+        return self._client is not None and self._client.is_connected
+
+    @property
     def active_session_count(self) -> int:
         """Return the number of currently tracked user sessions."""
         return len(self._user_sessions)
@@ -108,12 +113,21 @@ class CodexACPBridge:
 
         Waits for the underlying process to exit, then marks the bridge
         as not running and invokes the ``on_death`` callback if provided.
+
+        Uses a polling fallback to handle edge cases (e.g. Windows pipe
+        hangs where proc.wait() blocks despite the process having exited).
         """
         proc = self._client.process if self._client else None
         if proc is None:
             return
         try:
-            await proc.wait()
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            # proc.wait() didn't return in 10s — poll returncode instead
+            while True:
+                if proc.returncode is not None:
+                    break
+                await asyncio.sleep(2)
         except Exception:
             pass
         # Process exited — mark bridge as dead so get_bridge() will recreate it.
@@ -178,9 +192,18 @@ class CodexACPBridge:
         The agent subprocess reconnects to the session using its own
         persisted conversation history. If ``user_id`` is provided, the
         session is associated with that user for future lookups.
+
+        If the agent subprocess has exited (``is_connected`` is False),
+        the bridge is restarted automatically before attempting to load.
         """
         if self._client is None:
             raise RuntimeError("ACP bridge is not started")
+        if not self._client.is_connected:
+            # Agent subprocess exited — restart it before loading session.
+            logger.info("load-session-reconnecting", session_id=session_id)
+            await self._client.stop()
+            self._client = None
+            await self.start()
         loaded_id = await self._client.load_session(session_id)
         if user_id:
             old_session_id = self._user_sessions.get(user_id)
@@ -209,15 +232,25 @@ class CodexACPBridge:
         on_text: Callable[[str], None] | None = None,
         on_state_change: Callable[[SessionState], None] | None = None,
         on_session_reset: Callable[[], None] | None = None,
+        extra_blocks: list[Any] | None = None,
     ) -> SessionState:
         """Send a chat message to the ACP agent.
 
         ``on_session_reset`` is called (synchronously) when a new session
         had to be created because no prior one existed — useful for
         notifying the user that their context has been lost.
+
+        ``extra_blocks`` is a list of additional ACP content blocks (e.g.
+        ``image_block``) appended to the prompt after the text block.
         """
         if self._client is None:
             raise RuntimeError("ACP bridge is not started")
+        if not self._client.is_connected:
+            # Agent subprocess exited — restart it before sending message.
+            logger.info("chat-reconnecting")
+            await self._client.stop()
+            self._client = None
+            await self.start()
         active_session_id = session_id
         if not active_session_id:
             if not user_id:
@@ -230,6 +263,7 @@ class CodexACPBridge:
             session_id=active_session_id,
             on_text=on_text,
             on_state_change=on_state_change,
+            extra_blocks=extra_blocks,
         )
 
     async def cancel(self, user_id: str | None = None, session_id: str | None = None) -> None:

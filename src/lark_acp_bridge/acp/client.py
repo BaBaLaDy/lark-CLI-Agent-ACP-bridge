@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import structlog
-from acp import PROTOCOL_VERSION, Client, RequestError, spawn_agent_process, text_block
+from acp import PROTOCOL_VERSION, Client, RequestError, image_block, spawn_agent_process, text_block
 from acp.schema import (
     AgentMessageChunk,
     AgentPlanUpdate,
@@ -48,6 +48,33 @@ SessionStatus = Literal["running", "done", "cancelled", "error", "timeout"]
 
 
 @dataclass
+class ImageInfo:
+    """Represents an image emitted by the agent.
+
+    Two source kinds are supported:
+
+    1. **Local path** (preferred): the agent saves the image to disk and emits
+       a ``[image: /abs/path.png]`` marker in its text reply.  ``local_path``
+       is populated; ``data`` is empty.  The Feishu bot opens the file and
+       uploads it directly.
+    2. **Inline base64** (legacy / ACP ``ImageContentBlock``): ``data`` holds
+       the base64 string and ``mime_type`` the MIME.  Decoded in-memory
+       before upload.
+
+    ``img_key`` is filled by the Feishu bot after uploading to Feishu's image
+    API (``POST /open-apis/im/v1/images``).  ``insert_after_chars`` records
+    the character offset in ``SessionState.full_text`` where this image
+    should be interleaved with the surrounding text.
+    """
+
+    data: str = ""
+    mime_type: str = "image/png"
+    img_key: str | None = None
+    insert_after_chars: int = 0
+    local_path: str | None = None
+
+
+@dataclass
 class SessionState:
     """Accumulates streaming updates for one prompt turn.
 
@@ -59,6 +86,7 @@ class SessionState:
     text_chunks: list[str] = field(default_factory=list)
     thinking_chunks: list[str] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    images: list[ImageInfo] = field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
     status: SessionStatus = "running"
@@ -81,6 +109,23 @@ class SessionState:
         self.text_chunks.append(delta)
         for listener in self._text_listeners:
             listener(delta)
+        self._notify()
+
+    def emit_image(self, data: str, mime_type: str) -> None:
+        """Store an image emitted by the agent.
+
+        The image is not uploaded here — that happens in the Feishu bot
+        layer (``_upload_pending_images``).  ``insert_after_chars`` records
+        where the image should appear relative to the current ``full_text``
+        so the renderer can interleave text and images.
+        """
+        self.images.append(
+            ImageInfo(
+                data=data,
+                mime_type=mime_type,
+                insert_after_chars=len(self.full_text),
+            )
+        )
         self._notify()
 
     def _notify(self) -> None:
@@ -137,7 +182,7 @@ class BridgeClient(Client):
             if isinstance(content, TextContentBlock):
                 state.emit_text(content.text)
             elif isinstance(content, ImageContentBlock):
-                state.emit_text("[image]")
+                state.emit_image(content.data, content.mime_type)
             elif isinstance(content, AudioContentBlock):
                 state.emit_text("[audio]")
             elif isinstance(content, ResourceContentBlock):
@@ -274,6 +319,7 @@ class ACPClient:
             *self.command,
             env=merged_env,
             cwd=self.cwd,
+            transport_kwargs={"limit": 10 * 1024 * 1024},  # 10 MB readline buffer
         )
         self._conn, self._process = await self._context_manager.__aenter__()
         await self._conn.initialize(
@@ -303,6 +349,7 @@ class ACPClient:
         session_id: str | None = None,
         on_text: Callable[[str], None] | None = None,
         on_state_change: Callable[["SessionState"], None] | None = None,
+        extra_blocks: list[Any] | None = None,
     ) -> SessionState:
         if self._conn is None:
             raise RuntimeError("ACP client is not started")
@@ -317,7 +364,10 @@ class ACPClient:
             state.on_state_change(on_state_change)
 
         try:
-            await self._conn.prompt(session_id=active_session_id, prompt=[text_block(message)])
+            blocks: list[Any] = [text_block(message)]
+            if extra_blocks:
+                blocks.extend(extra_blocks)
+            await self._conn.prompt(session_id=active_session_id, prompt=blocks)
         finally:
             self._bridge_client.end_turn(active_session_id)
         return state
@@ -352,6 +402,18 @@ class ACPClient:
     def process(self) -> Any:
         """Return the underlying subprocess, or None if not running."""
         return self._process
+
+    @property
+    def is_connected(self) -> bool:
+        """Return True if the ACP connection is alive and usable."""
+        if self._conn is None or self._process is None:
+            return False
+        try:
+            return not getattr(self._conn, "_disconnected", False) and not getattr(
+                self._conn, "_closed", False
+            )
+        except Exception:
+            return False
 
     async def __aenter__(self) -> "ACPClient":
         await self.start()
